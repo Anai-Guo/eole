@@ -107,6 +107,18 @@ class Inference(object):
         self.top_k = config.top_k
         self.top_p = config.top_p
 
+        # Self-speculative decoding via MTP auxiliary heads (no-op unless the
+        # model was trained with num_mtp_heads > 0). Only meaningful for
+        # greedy, single-beam decoding: silently disabled otherwise so that
+        # the flag can be left on regardless of other decoding settings.
+        num_mtp_heads = len(getattr(self.model, "mtp_heads", []))
+        self.self_speculative_decoding = (
+            getattr(config, "self_speculative_decoding", False)
+            and num_mtp_heads > 0
+            and self.beam_size == 1
+            and (self.top_k == 1 or self.temperature == 0.0)
+        )
+
         self.min_length = config.min_length
         self.ban_unk_token = config.ban_unk_token
         self.ratio = config.ratio
@@ -551,6 +563,7 @@ class Inference(object):
         step=None,
         return_attn=False,
         images=None,
+        return_hidden=False,
     ):
 
         # Decoder forward, takes [batch, tgt_len, nfeats] as input
@@ -607,6 +620,8 @@ class Inference(object):
         scores = self.model.generator(dec_out.squeeze(1))
         log_probs = log_softmax(scores, dim=-1)  # we keep float16 if FP16
         # returns [(batch_size x beam_size), vocab_size]
+        if return_hidden:
+            return log_probs, attn, dec_out
         return log_probs, attn
 
     def predict_batch(self, batch, attn_debug, streamer=None):

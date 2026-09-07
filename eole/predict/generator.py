@@ -212,22 +212,40 @@ class GeneratorLM(Inference):
                     torch.cuda.synchronize()
                 beg_time = time()
 
-            for step in range(decode_strategy.max_length):
+            # Self-speculative decoding (via MTP heads) only applies to the
+            # simple greedy, single-beam case; it needs the exact combination
+            # of a deterministic `advance()` (see Inference.__init__ gating)
+            # and a decode strategy that grows `alive_seq` by one token per
+            # `advance()` call, which BeamSearchLM does not guarantee.
+            use_spec_decoding = (
+                self.self_speculative_decoding
+                and isinstance(decode_strategy, GreedySearchLM)
+                and parallel_paths == 1
+                and not decode_strategy.return_attention
+                and len(getattr(self.model, "mtp_heads", [])) > 0
+            )
+
+            step = 0
+            is_first_iter = True
+            while step < decode_strategy.max_length:
 
                 decoder_input = src if step == 0 else decode_strategy.current_predictions.view(-1, 1)
+                cur_pos = step if step == 0 else step + prefill_length - 1
 
-                log_probs, attn = self._decode_and_generate(
+                log_probs, attn, dec_out = self._decode_and_generate(
                     decoder_input,
                     None,
                     src_len=decode_strategy.src_len,
-                    step=step if step == 0 else step + prefill_length - 1,
+                    step=cur_pos,
                     images=batch.get("images", None) if step == 0 else None,
+                    return_hidden=True,
                 )
 
                 if step == 0:
                     log_probs = self.tile_to_beam_size_after_initial_step(fn_tile, log_probs)
 
                 decode_strategy.advance(log_probs, attn)
+                step += 1
                 any_finished = any([any(sublist) for sublist in decode_strategy.is_finished_list])
 
                 if streamer is not None:
@@ -240,14 +258,33 @@ class GeneratorLM(Inference):
                     if decode_strategy.done:
                         break
 
+                # (5b) Self-speculative decoding: draft extra candidate tokens
+                # with the MTP heads and verify them with a single additional
+                # main-model forward pass over the drafted chunk.
+                if use_spec_decoding and step < decode_strategy.max_length:
+                    step = self._speculative_draft_verify(
+                        decode_strategy,
+                        dec_out,
+                        cur_pos,
+                        prefill_length,
+                        step,
+                        streamer=streamer,
+                    )
+                    any_finished = any([any(sublist) for sublist in decode_strategy.is_finished_list])
+                    if any_finished:
+                        decode_strategy.update_finished()
+                        if decode_strategy.done:
+                            break
+
                 if parallel_paths > 1 or (any_finished and not decode_strategy.static_batch_size):
                     # select indexes in model state/cache
                     self.model.decoder.map_state(lambda state: state[decode_strategy.select_indices])
 
-                if self.report_time and step == 0:
+                if self.report_time and is_first_iter:
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     self.step0_time.append(time() - beg_time)
+                is_first_iter = False
 
                 self.model.decoder._extend_cache()  # noop when dynamic_shape is False
 
@@ -306,6 +343,86 @@ class GeneratorLM(Inference):
             decode_strategy,
             estim,
         )
+
+    def _speculative_draft_verify(self, decode_strategy, dec_out, cur_pos, prefill_length, step, streamer=None):
+        """Draft extra candidate tokens with the model's MTP heads and verify
+        them against the main model in a single additional forward pass
+        (self-speculative decoding).
+
+        Because ``decode_strategy`` is required (by the caller) to be a
+        single-beam :class:`~eole.predict.greedy_search.GreedySearchLM` using
+        deterministic ``_pick`` (see ``Inference.self_speculative_decoding``
+        gating), re-feeding the main model's own verification log-probs
+        through :meth:`~eole.predict.decode_strategy.DecodeStrategy.advance`
+        reproduces *exactly* the tokens standard step-by-step greedy decoding
+        would have produced -- speculative decoding here is a latency
+        optimization only, it does not change the output.
+
+        Args:
+            decode_strategy (GreedySearchLM): current decode strategy;
+                mutated in place via repeated ``advance()`` calls.
+            dec_out (Tensor): ``(batch, 1, hidden)`` hidden state (pre
+                generator) that produced the last confirmed token
+                (``decode_strategy.current_predictions``), at absolute
+                position ``cur_pos``.
+            cur_pos (int): absolute position of ``dec_out``.
+            prefill_length (int): length of the initial prompt (unused here,
+                kept for symmetry with the main loop's position bookkeeping).
+            step (int): number of tokens generated so far (i.e. length of
+                ``alive_seq`` minus the initial bos/prefix token).
+            streamer (GenerationStreamer, optional): forwarded token stream.
+
+        Returns:
+            int: updated ``step`` after accepting zero or more extra tokens.
+        """
+        seed_token = decode_strategy.current_predictions.view(-1, 1)
+        draft_tokens = self.model.draft_mtp_tokens(dec_out, seed_token, cur_pos)
+        num_draft = len(draft_tokens)
+        # Do not draft past max_length.
+        num_draft = min(num_draft, decode_strategy.max_length - step)
+        if num_draft <= 0:
+            return step
+        draft_tokens = draft_tokens[:num_draft]
+        draft_tensor = torch.cat(draft_tokens, dim=1)  # (B, num_draft)
+        # Re-score [seed_token, draft_1, ..., draft_N] with the main model in
+        # a single forward pass; verify_log_probs[:, i, :] is the main
+        # model's own prediction for the token following position `i` of
+        # this chunk (index 0 = seed_token, already confirmed).
+        verify_input = torch.cat([seed_token, draft_tensor], dim=1)  # (B, num_draft + 1)
+        verify_log_probs, _ = self._decode_and_generate(
+            verify_input,
+            None,
+            src_len=decode_strategy.src_len,
+            step=cur_pos + 1,
+        )
+        predicted = verify_log_probs.argmax(dim=-1)  # (B, num_draft + 1)
+
+        accepted = 0
+        while accepted < num_draft and torch.equal(predicted[:, accepted], draft_tokens[accepted].squeeze(1)):
+            accepted += 1
+
+        # Roll back the KV cache entries written for rejected draft tokens.
+        # Cache writes are position-indexed via `cache_seqlens`, so rewinding
+        # the pointer is enough: those slots are silently overwritten by the
+        # next forward pass.
+        rollback = num_draft - accepted
+        if rollback > 0 and self.model.decoder.cache_seqlens is not None:
+            self.model.decoder.cache_seqlens -= rollback
+
+        # Feed each accepted draft token's *verified* log-probs through the
+        # normal `advance()` path (accepted tokens), plus one "bonus" token
+        # from the main model's own prediction at the point of divergence
+        # (or, if every draft was accepted, the extra free token past the
+        # last draft) -- `_pick` is deterministic here so this reproduces the
+        # token already computed in `predicted`.
+        for i in range(accepted + 1):
+            decode_strategy.advance(verify_log_probs[:, i, :], None)
+            step += 1
+            if streamer is not None:
+                streamer.put(decode_strategy.current_predictions[:1])
+            if any(any(sublist) for sublist in decode_strategy.is_finished_list):
+                break
+        return step
 
     def _score_target(self, batch, enc_out, src_len):
         src = batch["src"]

@@ -151,6 +151,15 @@ class DecodingConfig(Config):
     estim_only: bool = Field(default=False, description="Process the input to estimator only (no decoder).")
     attn_debug: bool = Field(default=False, description="Print best attn for each word.")
     align_debug: bool = Field(default=False, description="Print best align for each word.")
+    self_speculative_decoding: bool = Field(
+        default=False,
+        description="Use the model's own Multi-Token Prediction (MTP) auxiliary heads "
+        "(see the decoder's num_mtp_heads) to draft extra candidate tokens and verify "
+        "them against the main model in a single additional forward pass, reducing the "
+        "number of sequential decoding steps. No-op if the model has no MTP heads. "
+        "Only supported for greedy, single-beam decoding (beam_size=1) so that outputs "
+        "are identical to standard greedy decoding.",
+    )
 
 
 # in legacy opts, decoding config is separated (probably to be used elsewhere)
